@@ -1,6 +1,6 @@
 from asgiref.sync import sync_to_async
 from django.utils import timezone
-from .models import NetworkTraffic, ThreatIncident
+from .models import NetworkTraffic, ThreatIncident, ResponseRule, LogEntry
 
 
 async def save_traffic_and_incidents(packet_data: dict):
@@ -74,8 +74,9 @@ async def save_traffic_and_incidents(packet_data: dict):
 			confidence=confidence_val,
 		)
 		# Build a lightweight payload for WS broadcast
-		return {
-			"id": getattr(created, "id", None),
+		# Ensure returned values are JSON-serializable (convert UUIDs to strings)
+		incident_payload = {
+			"id": str(getattr(created, "id", None)),
 			"timestamp": getattr(created, "timestamp", timezone.now()).isoformat(),
 			"source_ip": created.source_ip,
 			"destination_ip": created.destination_ip,
@@ -84,5 +85,52 @@ async def save_traffic_and_incidents(packet_data: dict):
 			"status": created.status,
 			"confidence": created.confidence,
 		}
+
+		# Evaluate active response rules (comma-separated key=value, all clauses must match)
+		try:
+			active_rules = await sync_to_async(list)(ResponseRule.objects.filter(is_active=True))
+			for rule in active_rules:
+				cond = (rule.condition or "").strip()
+				if not cond:
+					continue
+				matched = True
+				for clause in cond.split(','):
+					cl = clause.strip()
+					if not cl:
+						continue
+					if '=' not in cl:
+						matched = False
+						break
+					k, v = [p.strip() for p in cl.split('=', 1)]
+					# compare string representations (case-insensitive)
+					val = incident_payload.get(k)
+					if val is None:
+						val = getattr(created, k, None)
+					if val is None:
+						matched = False
+						break
+					if str(val).lower() != str(v).lower():
+						matched = False
+						break
+				if matched:
+					# create a log entry and increment triggered_count
+					try:
+						await sync_to_async(LogEntry.objects.create)(
+							action=rule.action or "rule_trigger",
+							target=str(getattr(created, 'id', '')),
+							result="Success",
+							details=f"Rule '{rule.name}' triggered for incident {getattr(created, 'id', None)}",
+							severity="Info",
+						)
+						rule.triggered_count = (rule.triggered_count or 0) + 1
+						await sync_to_async(rule.save)()
+					except Exception:
+						# ignore logging errors to avoid breaking incident creation
+						continue
+		except Exception:
+			# don't let rule engine failure prevent incident flow
+			pass
+
+		return incident_payload
 	# No incident created
 	return None

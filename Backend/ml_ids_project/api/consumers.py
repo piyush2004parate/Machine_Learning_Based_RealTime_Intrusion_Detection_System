@@ -3,7 +3,7 @@ import datetime
 import asyncio
 import uuid
 from channels.generic.websocket import AsyncWebsocketConsumer
-from .utils.ml_classifier import AnomalyDetector
+from .utils.knn_classifier import KNNAnomalyDetector
 from .db_utils import save_traffic_and_incidents  # pyright: ignore[reportMissingImports]
 
 # Scapy capture imports
@@ -31,7 +31,21 @@ def _port_to_service(port: int | None) -> str | None:
 
 # Instantiate the machine learning model ONCE when the server starts.
 # This ensures we use the same trained model for all connections.
-anomaly_detector = AnomalyDetector()
+import os
+from django.conf import settings
+
+# Initialize KNN detector with saved model
+model_dir = os.path.join(settings.BASE_DIR, '..', '..', 'model', 'unsw_tabular')
+model_path = os.path.join(model_dir, 'model_knn.pkl')
+features_path = os.path.join(model_dir, 'features_knn.json')
+scaler_path = os.path.join(model_dir, 'scaler_knn.pkl')
+
+try:
+    anomaly_detector = KNNAnomalyDetector(model_path, features_path, scaler_path)
+except Exception:
+    # If model not found, create detector without loading model
+    # (will be used for packet collection, not classification)
+    anomaly_detector = None
 
 # Per-flow state for basic metrics using canonical 5-tuple key
 # key = (ipA, portA, ipB, portB, protocol) where (A,portA) < (B,portB) lexicographically
@@ -98,13 +112,16 @@ class TrafficConsumer(AsyncWebsocketConsumer):
         try:
             while True:
                 data = await self.out_queue.get()
-                # Send to client
+                # Send traffic to client (flat dict with top-level timestamp)
                 await self.send(text_data=json.dumps(data))
                 # Persist to DB and emit incident live if created
                 try:
                     incident = await save_traffic_and_incidents(data)
                     if incident:
-                        await self.send(text_data=json.dumps({"_type": "incident", "data": incident}))
+                        # Send incident as a flat dict with a _type so the frontend can treat it
+                        # the same way as traffic rows (it will have a top-level timestamp)
+                        incident["_type"] = "incident"
+                        await self.send(text_data=json.dumps(incident))
                 except Exception as e:
                     print(f"Error saving traffic/incidents: {e}")
                 # Throttle to 1 message per second
@@ -157,7 +174,29 @@ class TrafficConsumer(AsyncWebsocketConsumer):
                     "timestamp": datetime.datetime.now().timestamp(),
                 }
 
-                status, severity = anomaly_detector.classify_packet(features)
+                # KNN anomaly detection
+                status = "Normal"
+                severity = "Low"
+                probs = []
+                pred_idx = 0
+                pred_prob = 0.0
+                
+                if anomaly_detector is not None:
+                    try:
+                        # Get prediction from KNN model
+                        result = anomaly_detector.predict(features)
+                        pred_label = result.get('label', 'Normal')
+                        status = pred_label
+                        severity = "Critical" if pred_label == "Anomalous" else "Low"
+                        pred_idx = result.get('prediction', 0)
+                        pred_prob = result.get('confidence', 0.0)
+                        probs = [
+                            result.get('probabilities', {}).get('normal', 0.0),
+                            result.get('probabilities', {}).get('anomalous', 0.0)
+                        ]
+                    except Exception:
+                        # If classifier fails, fall back to Normal
+                        status, severity, probs, pred_idx, pred_prob = "Normal", "Low", [], 0, 0.0
 
                 # Build canonical key
                 left = (ip_layer.src, sport or 0)
@@ -296,7 +335,9 @@ class TrafficConsumer(AsyncWebsocketConsumer):
                 # Compute ct_* counters over recent window
                 def _count(pred):
                     c = 0
-                    for ev in recent_events:
+                    # iterate over a snapshot of the deque to avoid "deque mutated during iteration"
+                    # which can occur when the sniffing thread appends while another thread is iterating
+                    for ev in list(recent_events):
                         try:
                             if pred(ev):
                                 c += 1
@@ -314,10 +355,9 @@ class TrafficConsumer(AsyncWebsocketConsumer):
                 # Approximate ct_srv_dst as same source to same destination and same service
                 ct_srv_dst = _count(lambda ev: (ev.get("src") == ip_layer.src) and (ev.get("dst") == ip_layer.dst) and (ev.get("service") == service))
 
-                # Derive numeric label from status for UI/API: 0=normal, 1=anomalous/blocked
+                # Derive numeric label from model prediction for UI/API: 0=normal, 1=anomalous/blocked
                 try:
-                    status_lower = (status or "").lower()
-                    label_val = 0 if status_lower == "normal" else 1
+                    label_val = 0 if int(pred_idx) == 0 else 1
                 except Exception:
                     label_val = 0
 
@@ -331,6 +371,9 @@ class TrafficConsumer(AsyncWebsocketConsumer):
                     "bytes": length_val,
                     "status": status,
                     "severity": severity,
+                    "probs": probs,
+                    "pred_idx": pred_idx,
+                    "pred_prob": pred_prob,
                     "label": label_val,
                     # Extended metrics (best-effort live approximation)
                     "dur": dur,
@@ -377,9 +420,17 @@ class TrafficConsumer(AsyncWebsocketConsumer):
                     pass
 
                 # Enqueue for async, throttled sending on the main loop
-                asyncio.run_coroutine_threadsafe(
-                    self.out_queue.put(data), self.main_loop
-                )
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.out_queue.put(data), self.main_loop
+                    )
+                except RuntimeError:
+                    # Event loop is shutting down or closed (e.g., during reload/stop).
+                    # Skip scheduling the coroutine to avoid 'cannot schedule new futures'
+                    return
+                except Exception as e:
+                    # Log and continue; we don't want a background packet to crash the sniff thread
+                    print(f"Failed to schedule outbound send: {e}")
             except Exception as e:
                 print(f"Error processing a Scapy packet: {e}")
 

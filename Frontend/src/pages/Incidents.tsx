@@ -132,9 +132,9 @@ export const Incidents: React.FC = () => {
       render: (item: ThreatIncident) => `${item.confidence}%`,
       sortable: true,
     },
-    {
-        key: 'id' as keyof ThreatIncident,
-        header: 'Actions',
+  {
+    key: 'actions' as keyof ThreatIncident,
+    header: 'Actions',
         render: (item: ThreatIncident) => (
           <div className="flex items-center space-x-2">
             <button
